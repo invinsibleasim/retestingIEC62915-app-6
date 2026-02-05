@@ -1,498 +1,300 @@
 # streamlit_app.py
-# IEC TS 62915:2023 Retesting Planner (indicative, customizable)
-# Author: Asim's Copilot
-# Notes:
-# - This app provides an engineering-judgment *starting point* for retesting planning.
-# - Final test sequences & sample counts MUST be taken from the official IEC matrix and
-#   the invoked base standards: IEC 61215:2021 (design qualification) and IEC 61730:2023 (safety).
-# - 62915:2023 adds clarity for new tests (e.g., MQT 20 dynamic mechanical load; MQT 21 PID),
-#   separates 61215 vs 61730 retest requirements, and references IEC 62941 QMS and IEC 62788 component series.
-# - Corrigendum 1 (2024) updates the "electrical termination" subclause language and points back to
-#   IEC 61730-2 Clause 6 and IEC 61215-1 Clause 4 for module/component testing.
+# EL image → Dark I–V (module) with robust per-cell diode solve
+# Fixes included:
+# - Adds Ns (series cell count) and uses per-cell voltage in the diode exponent
+# - Guards coarse search so 'best' is always valid; clips exp() argument
+# - Handles NaNs/overflow robustly
 
-import re
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
 from io import BytesIO
 
-import pandas as pd
-import streamlit as st
+st.set_page_config(page_title="EL → Dark I–V (Module)", layout="wide")
 
-st.set_page_config(page_title="IEC TS 62915:2023 Retesting Planner", layout="wide")
+st.title("EL image → Dark I–V (Module)")
 
-# -----------------------------
-# Reference: MQT test dictionary (descriptions are brief & generic for planning)
-# -----------------------------
-MQT_INFO = {
-    "MQT 01": "Visual inspection",
-    "MQT 02": "Maximum power determination (STC) / Performance check",
-    "MQT 03": "Insulation test",
-    "MQT 04": "Measurement of temperature coefficients",
-    "MQT 06.1": "Performance at STC",
-    "MQT 07": "Performance at low irradiance",
-    "MQT 08": "Outdoor exposure test",
-    "MQT 09": "Hot-spot endurance test",
-    "MQT 10": "UV preconditioning",
-    "MQT 11": "Thermal cycling test (e.g., TC50/TC200)",
-    "MQT 12": "Humidity freeze test (e.g., HF10)",
-    "MQT 13": "Damp heat (e.g., DH1000)",
-    "MQT 14": "Robustness of termination (ROT)",
-    "MQT 14.1": "Retention of junction box on mounting surface (ROT)",
-    "MQT 14.2": "Cord anchorage (ROT)",
-    "MQT 15": "Wet leakage current test",
-    "MQT 16": "Static mechanical load test",
-    "MQT 17": "Hail test",
-    "MQT 18": "Bypass diode thermal test",
-    "MQT 19": "Stabilization",
-    "MQT 20": "Cyclic (dynamic) mechanical load",
-    "MQT 21": "Potential-induced degradation (PID)",
-    "MQT 22": "Bending test",
-}
-
-# -----------------------------
-# Reference: IEC 61730 (Safety) - test descriptions (selected)
-# -----------------------------
-MST_INFO = {
-    "MST 01": "Visual inspection",
-    "MST 02": "Performance at STC",
-    "MST 03": "Maximum power determination",
-    "MST 04": "Insulation thickness",
-    "MST 05": "Durability of markings",
-    "MST 06": "Sharp edge test",
-    "MST 07": "Bypass diode functionality test",
-    "MST 11": "Accessibility test",
-    "MST 12": "Cut susceptibility test",
-    "MST 13": "Continuity test for equipotential bonding",
-    "MST 14": "Impulse voltage test",
-    "MST 16": "Insulation test",
-    "MST 17": "Wet leakage current test",
-    "MST 22": "Hot-spot endurance test",
-    "MST 23": "Fire test",
-    "MST 24": "Ignitability test",
-    "MST 25": "Bypass diode thermal test",
-    "MST 26": "Reverse current overload test (RCOT)",
-    "MST 32": "Module breakage test (MBT)",
-    "MST 33": "Screw connection test",
-    "MST 34": "Static mechanical load test",
-    "MST 35": "Peel test",
-    "MST 36": "Lap shear strength test",
-    "MST 37": "Materials creep test",
-    "MST 42": "Robustness of terminations (maps to MQT 14)",
-    "MST 51": "Thermal cycling (TC50/TC200)",
-    "MST 52": "Humidity freeze (HF10)",
-    "MST 53": "Damp heat (DH200/DH1000)",
-    "MST 54": "UV preconditioning",
-    "MST 55": "Cold conditioning",
-    "MST 56": "Dry heat conditioning",
-    "MST 57": "Evaluation of insulation coordination",
-}
-
-# Merge to a single description map for convenience
-DESCR_MAP = {**MQT_INFO, **MST_INFO}
-
-def describe_label(label: str) -> str:
-    """
-    Extract 'MQT xx[.x]' or 'MST xx[.x]' code from a label like 'TC50 (MQT 11)' or 'RCOT (MST 26)'
-    and return a human-readable description; else return ''.
-    """
-    if not isinstance(label, str):
-        return ""
-    # Normalize HTML entities if any were pasted in
-    s = label.replace("&amp;", "&")
-    m = re.search(r"\b(MQT|MST)\s*\d+(\.\d+)?\b", s, flags=re.IGNORECASE)
-    if m:
-        code = f"{m.group(1).upper()} {m.group(0).split()[-1]}"
-        return DESCR_MAP.get(code, "")
-    return ""
-
-# -----------------------------
-# Indicative retest matrix for Wafer-Based Technology (WBT) modules
-# (Engineering judgment placeholders – align with the official 62915 matrix before use)
-# -----------------------------
-WBT_MATRIX = {
-    "Frontsheet change": {
-        "IEC 61215": [
-            "Hot-spot endurance test (MQT 09)",
-            "UV15 (MQT 10)",
-            "DMLT (MQT 20)",
-            "TC50 (MQT 11)",
-            "HF10 (MQT 12)",
-            "ROT (MQT 14.1)",
-            "DH1000 (MQT 13)",
-            "Bending test (MQT 22) for Flexible module",
-            "SMLT (MQT 16)",
-            "Hail (MQT 17)",
-        ],
-        "IEC 61730": [
-            "Insulation thickness (MST 04) if non-glass",
-            "Cut susceptibility (MST 12) if non-glass",
-            "Impulse voltage test (MST 14)",
-            "Ignitability test (MST 24) if non-glass",
-            "Module breakage test (MST 32)",
-            "Peel/Lap (MST 35/36) for cemented joints / thickness change",
-            "Materials creep (MST 37)",
-            "Sequence B if non-glass",
-            "Sequence B1 if PD1",
-        ],
-    },
-    "Encapsulant (EVA/POE) change or stack change": {
-        "IEC 61215": [
-            "Hot-spot endurance test (MQT 09)",
-            "UV15 (MQT 10)",
-            "DMLT (MQT 20)",
-            "TC50 (MQT 11)",
-            "HF10 (MQT 12)",
-            "TC200 (MQT 11)",
-            "DH1000 (MQT 13)",
-            "Bending test (MQT 22) for Flexible module",
-            "PID (MQT 21)",
-            "Hail (MQT 17)",
-        ],
-        "IEC 61730": [
-            "Cut susceptibility (MST 12) if non-glass",
-            "Impulse voltage test (MST 14)",
-            "Module breakage test (MST 32)",
-            "Peel/Lap (MST 35/36) for cemented joints",
-            "Materials creep (MST 37)",
-            "Sequence B",
-            "Sequence B1 if PD1",
-        ],
-    },
-    "Cell technology change (e.g., PERC → TOPCon/HJT)": {
-        "IEC 61215": [
-            "Hot-spot endurance test (MQT 09)",
-            "DMLT (MQT 20)",
-            "TC50 (MQT 11)",
-            "HF10 (MQT 12)",
-            "TC200 (MQT 11)",
-            "DH1000 (MQT 13)",
-            "Bending test (MQT 22) for Flexible module",
-            "PID (MQT 21)",
-            "SMLT (MQT 16)",
-            "Hail (MQT 17)",
-        ],
-        "IEC 61730": ["RCOT (MST 26)"],
-    },
-    "Interconnect/ribbon/paste change": {
-        "IEC 61215": [
-            "Hot-spot endurance test (MQT 09)",
-            "TC200 (MQT 11)",
-            "DH1000 (MQT 13)",
-        ],
-        "IEC 61730": ["RCOT (MST 26)"],
-    },
-    "Backsheet change": {
-        "IEC 61215": [
-            "Hot-spot endurance test (MQT 09)",
-            "UV15 (MQT 10)",
-            "DMLT (MQT 20)",
-            "TC50 (MQT 11)",
-            "HF10 (MQT 12)",
-            "ROT (MQT 14.1)",
-            "DH1000 (MQT 13)",
-            "Bending test (MQT 22) for Flexible module",
-            "SMLT (MQT 16)",
-            "Hail (MQT 17)",
-        ],
-        "IEC 61730": [
-            "Insulation thickness (MST 04) if non-glass",
-            "Cut susceptibility (MST 12) if non-glass",
-            "Impulse voltage test (MST 14)",
-            "Ignitability test (MST 24) if non-glass",
-            "Module breakage test (MST 32)",
-            "Peel/Lap (MST 35/36) for cemented joints / thickness change",
-            "Materials creep (MST 37)",
-            "Sequence B if non-glass",
-            "Sequence B1 if PD1",
-        ],
-    },
-    "Electrical termination (J-box/cable/connector) change": {
-        "IEC 61215": [
-            "UV15 (MQT 10)",
-            "DMLT (MQT 20)",
-            "TC50 (MQT 11)",
-            "HF10 (MQT 12)",
-            "ROT (MQT 14.1)",
-            "ROT (MQT 14.2)",
-            "DH1000 (MQT 13)",
-            "BPDT (MQT 18)",
-        ],
-        "IEC 61730": [
-            "Insulation thickness (MST 04) if non-glass",
-            "Cut susceptibility (MST 12) if non-glass",
-            "Impulse voltage test (MST 14)",
-            "Ignitability test (MST 24) if non-glass",
-            "Module breakage test (MST 32)",
-            "Peel/Lap (MST 35/36) for cemented joints / thickness change",
-            "Materials creep (MST 37)",
-            "Sequence B if non-glass",
-            "Sequence B1 if PD1",
-        ],
-    },
-    "Bypass diode change": {
-        "IEC 61215": ["Hot-spot endurance test (MQT 09)", "TC200 (MQT 11)", "BPDT (MQT 18)"],
-        "IEC 61730": ["RCOT (MST 26)"],
-    },
-    "Electrical circuitry change": {
-        "IEC 61215": ["Hot-spot endurance test (MQT 09)", "TC200 (MQT 11)", "BPDT (MQT 18)"],
-        "IEC 61730": [
-            "Cut susceptibility (MST 12) for rerouting of output leads (polymeric backsheet or frontsheet)",
-            "Insulation thickness (MST 04) for rerouting of output leads (polymeric backsheet or frontsheet)",
-            "RCOT (MST 26)",
-        ],
-    },
-    "Edge seal change": {
-        "IEC 61215": ["UV15 (MQT 10)", "DMLT (MQT 20)", "TC50 (MQT 11)", "HF10 (MQT 12)", "DH1000 (MQT 13)"],
-        "IEC 61730": [
-            "Impulse voltage test (MST 14)",
-            "Ignitability test (MST 24) only if edge sealing is accessible",
-            "Peel/Lap (MST 35/36) for cemented joints / thickness change",
-            "Sequence B (not for different thickness or width)",
-            "Sequence B1 if PD1",
-        ],
-    },
-    "Frame/mounting redesign": {
-        "IEC 61215": ["UV15 (MQT 10)", "DMLT (MQT 20)", "TC50 (MQT 11)", "HF10 (MQT 12)", "DH1000 (MQT 13) for polymeric frame", "SMLT (MQT 16)", "Hail (MQT 17)"],
-        "IEC 61730": [
-            "Continuity test of equipotential bonding (MST 13)",
-            "Ignitability test (MST 24) for polymeric frame",
-            "Module breakage test (MST 32)",
-            "Screw connection (MST 33) if applicable",
-            "Sequence B (not for polymeric frames)",
-        ],
-    },
-    "Module size change": {
-        "IEC 61215": ["TC200 (MQT 11)", "DH1000 (MQT 13)", "SMLT (MQT 16)", "Hail (MQT 17)", "Bending test (MQT 22) for Flexible module"],
-        "IEC 61730": ["RCOT (MST 26)", "Module breakage test (MST 32)"],
-    },
-    "Higher/lower power with identical design & size": {
-        "IEC 61215": [
-            "Performance at STC (MQT 06.1)",
-            "Stabilization (MQT 19) for lower power models",
-            "Hot-spot endurance test (MQT 09)",
-            "TC200 (MQT 11)",
-            "BPDT (MQT 18)",
-        ],
-        "IEC 61730": ["RCOT (MST 26)"],
-    },
-    "Increase OCPR (over-current protection rating)": {
-        "IEC 61215": [],
-        "IEC 61730": ["Continuity test of equipotential bonding (MST 13)", "RCOT (MST 26)"],
-    },
-    "Increase system voltage >5%": {
-        "IEC 61215": [
-            "Hot-spot endurance test (MQT 09)",
-            "UV15 (MQT 10)",
-            "DMLT (MQT 20)",
-            "TC50 (MQT 11)",
-            "HF10 (MQT 12)",
-            "DH1000 (MQT 13)",
-            "TC200 (MQT 11)",
-            "PID (MQT 21)",
-        ],
-        "IEC 61730": [
-            "Insulation thickness (MST 04)",
-            "Accessibility test (MST 11)",
-            "Module breakage test (MST 32)",
-            "Continuity test of equipotential bonding (MST 13)",
-            "Impulse voltage test (MST 14)",
-            "Sequence B",
-        ],
-    },
-    "Cell fixing / internal insulation tape change": {
-        "IEC 61215": ["HF10 (MQT 12)"],
-        "IEC 61730": [],
-    },
-    "External label/marking material change": {
-        "IEC 61215": [],
-        "IEC 61730": ["Sequence B", "Durability of markings (MST 05)"],
-    },
-    "Monofacial ↔ Bifacial change": {
-        "IEC 61215": [
-            "Hot-spot endurance test (MQT 09)",
-            "UV15 (MQT 10)",
-            "DMLT (MQT 20)",
-            "TC50 (MQT 11)",
-            "HF10 (MQT 12)",
-            "BPDT (MQT 18.1)",
-            "Performance at low irradiance (MQT 07)",
-            "Measurement of temperature coefficients (MQT 04)",
-            "TC200 (MQT 11)",
-            "PID (MQT 21)",
-        ],
-        "IEC 61730": ["Dielectric & Insulation", "Grounding & Earthing", "Accessibility & Marking"],
-    },
-}
-
-# For thin-film (MLI), simplified placeholders – align with the official matrix.
-MLI_MATRIX = {
-    "Frontsheet change": {
-        "IEC 61215": ["UV (MQT 10)", "DH (MQT 13)", "TC (MQT 11)", "HF (MQT 12)", "MQT 01", "MQT 02"],
-        "IEC 61730": ["Dielectric & Insulation", "Fire/Flammability (as applicable)"],
-    },
-    "Backsheet change": {
-        "IEC 61215": ["UV (MQT 10)", "DH (MQT 13)", "TC (MQT 11)", "HF (MQT 12)", "MQT 02"],
-        "IEC 61730": ["Dielectric & Insulation"],
-    },
-    "Electrical termination change": {
-        "IEC 61215": ["Wet leakage (MQT 15)", "MQT 01", "MQT 02"],
-        "IEC 61730": ["Wiring & Terminations", "Dielectric & Insulation"],
-    },
-    "Module size change": {
-        "IEC 61215": ["MQT 10", "MQT 20", "Hail (MQT 17)", "MQT 02"],
-        "IEC 61730": ["Dielectric & Insulation"],
-    },
-}
-
-# -----------------------------
-# Editable per-test sample counts (defaults are blank; you fill from IEC 61215/61730)
-# -----------------------------
-DEFAULT_SAMPLES = {
-    # Example: "MQT 13": "10"
-}
-
-# -----------------------------
-# App UI
-# -----------------------------
-st.title("IEC TS 62915:2023 Retesting Planner")
 st.markdown("""
-This tool helps plan **retesting** when **design/BOM** or **system rating** changes occur for PV modules.
-**Final sequences and sample counts must be confirmed** with the official IEC TS 62915:2023 matrix and the
-invoked standards **IEC 61215:2021** and **IEC 61730:2023**.
+Upload **EL images** at **multiple forward-bias setpoints** and a **metadata CSV**:
+
+- CSV columns (header required): `filename, V_applied_V, I_meas_A, exposure_s, gain_iso, temp_C`
+- Optional: dark frame image and flat-field image for camera corrections
+- The app:
+  1) Computes a trimmed log-intensity per image,
+  2) Fits EL slope → ideality `n`,
+  3) Fits single-diode dark parameters (`I0, n, Rs, Rsh`),
+  4) Generates and exports a dark I–V sweep.
 """)
 
-with st.expander("Standards scope & reminders", expanded=False):
-    st.markdown("""
-- **62915:2023 (Ed. 2.0)**: Retesting framework & matrix for typical modifications; clarifies **MQT 20** and **MQT 21**; separates 61215 vs 61730 retest paths.
-- **Sample counts & pass/fail**: Taken from **IEC 61215**/**IEC 61730**. Consider representative sampling where allowed.
-- **Electrical terminations**: See **IEC 61730-2 (Clause 6)** and **IEC 61215-1 (Clause 4)**; apply **COR1:2024** updates.
-- **QMS & components**: Ensure **IEC 62941**; consider **IEC 62788-1/-2** for sub-components.
-""")
-
+# -----------------------
+# Sidebar controls
+# -----------------------
 with st.sidebar:
-    st.header("Inputs")
-    tech = st.selectbox("Module technology", ["WBT (crystalline/wafer-based)", "MLI (thin-film)"])
-    matrix = WBT_MATRIX if tech.startswith("WBT") else MLI_MATRIX
+    st.header("Preprocessing")
+    border_crop_px = st.number_input("Crop border (pixels)", min_value=0, max_value=500, value=10, step=2)
+    trim_low = st.slider("Trim lowest % pixels", 0, 40, 5, step=1)
+    trim_high = st.slider("Trim highest % pixels", 0, 40, 5, step=1)
+    eps = st.number_input("Min intensity clamp (epsilon)", 1e-12, 1e-3, 1e-6, format="%.1e")
+    roi_box = st.text_input("ROI (x0,y0,w,h) optional", "")
 
-    mods = st.multiselect(
-        "Select the design/BOM changes",
-        options=list(matrix.keys()),
-        help="Pick all applicable modifications for this retest planning session."
-    )
+    st.header("Fitting")
+    # Physical constants
+    q = 1.602176634e-19
+    kB = 1.380649e-23
+    # Ns: number of cells in series (IMPORTANT for per-cell voltage)
+    Ns = st.number_input("Series cell count (Ns)", min_value=1, max_value=200, value=60, step=1)
+    ref_T = st.number_input("Assume module T for EL slope (°C)", -20.0, 120.0, 25.0)
+    n_reg = st.number_input("n regularization weight (0=off)", 0.0, 10.0, 1.0, step=0.5)
+    max_iter = st.number_input("Max iterations (implicit solve)", 10, 500, 60, step=10)
 
-    st.markdown("---")
-    st.subheader("New material/component combination?")
-    new_combo = st.checkbox(
-        "YES – New combination of materials/components (e.g., new J-box + cable + connector)",
-        value=False,
-        help="Adds relevant IEC 61730 wiring/termination safety checks."
-    )
+    st.header("Sweep")
+    v_min = st.number_input("Vmin for dark sweep (V)", 0.0, 2000.0, 0.0)
+    v_max = st.number_input("Vmax for dark sweep (V)", 0.1, 2000.0, 40.0)
+    v_pts = st.number_input("Points", 10, 5000, 400)
 
-    st.markdown("---")
-    st.subheader("Conservatism")
-    conservative = st.checkbox(
-        "Use conservative add-ons (include MQT 01/02 & wet leakage where uncertain)",
-        value=True
-    )
+# -----------------------
+# File inputs
+# -----------------------
+csv_file = st.file_uploader("Metadata CSV", type=["csv"])
+imgs = st.file_uploader("EL images (multi-select)", type=["png","tif","tiff","jpg","jpeg"], accept_multiple_files=True)
+dark_frame_file = st.file_uploader("Optional: dark frame", type=["png","tif","tiff","jpg","jpeg"])
+flat_field_file = st.file_uploader("Optional: flat-field", type=["png","tif","tiff","jpg","jpeg"])
 
-    st.markdown("---")
-    st.subheader("Sample counts (optional)")
-    st.caption("Enter per-test minimums from IEC 61215/61730; leave blank to keep unspecified.")
-    test_list_all = sorted(set(t for m in matrix.values() for t in (m["IEC 61215"] + m["IEC 61730"])))
-    sample_inputs = {}
-    for t in test_list_all:
-        sample_inputs[t] = st.text_input(f"Samples for {t}", value=str(DEFAULT_SAMPLES.get(t, "")), key=f"s_{t}")
+if not csv_file or not imgs:
+    st.info("Upload metadata CSV and at least 3 EL images to begin.")
+    st.stop()
 
-st.markdown("### Recommended retest plan")
-if not mods:
-    st.info("Select at least one modification in the sidebar to see the recommended plan.")
-else:
-    # Build the plan
-    plan_61215 = []
-    plan_61730 = []
+# -----------------------
+# Load metadata
+# -----------------------
+meta = pd.read_csv(csv_file)
+required_cols = ["filename","V_applied_V","I_meas_A","exposure_s","gain_iso","temp_C"]
+missing = [c for c in required_cols if c not in meta.columns]
+if missing:
+    st.error(f"CSV missing columns: {missing}")
+    st.stop()
 
-    for m in mods:
-        plan_61215.extend(matrix[m]["IEC 61215"])
-        plan_61730.extend(matrix[m]["IEC 61730"])
+# Index uploaded images by name
+img_by_name = {f.name: f for f in imgs}
 
-    if new_combo:
-        # Emphasize 61730 wiring/terminations when new component combinations are used
-        plan_61730.extend(["Wiring & Terminations", "Dielectric & Insulation"])
+# -----------------------
+# Load helper images
+# -----------------------
+def load_pil(file):
+    try:
+        if file is None:
+            return None
+        # Try to preserve bit depth; we'll normalize to float later
+        im = Image.open(file)
+        return im
+    except Exception:
+        return None
 
-    # Deduplicate while preserving order
-    def dedupe(seq):
-        seen = set()
-        out = []
-        for x in seq:
-            if x not in seen:
-                out.append(x)
-                seen.add(x)
-        return out
+dark_frame = load_pil(dark_frame_file)
+flat_field = load_pil(flat_field_file)
 
-    plan_61215 = dedupe(plan_61215)
-    plan_61730 = dedupe(plan_61730)
+# -----------------------
+# Image helpers
+# -----------------------
+def pil_to_float(im: Image.Image) -> np.ndarray:
+    """Convert PIL image to float64, normalized to ~[0, 1]."""
+    if im is None:
+        return None
+    if im.mode in ("I;16", "I"):
+        arr = np.array(im, dtype=np.float64)
+        # If 16-bit like I;16: use 65535 for scaling; else just max() to be safe
+        scale = 65535.0 if arr.max() > 255 else float(arr.max() or 1.0)
+        arr = arr / (scale if scale > 0 else 1.0)
+    else:
+        arr = np.array(im.convert("L"), dtype=np.float64)
+        scale = float(arr.max() or 1.0)
+        arr = arr / (scale if scale > 0 else 1.0)
+    return arr
 
-    # Conservative add-ons
-    if conservative:
-        if "MQT 01" not in plan_61215:
-            plan_61215.insert(0, "MQT 01")
-        if "MQT 02" not in plan_61215:
-            plan_61215.append("MQT 02")
-        if "Wet leakage (MQT 15)" not in plan_61215 and ("Dielectric & Insulation" in plan_61730):
-            plan_61215.append("Wet leakage (MQT 15)")
+def apply_corrections(arr: np.ndarray, dark: Image.Image = None, flat: Image.Image = None) -> np.ndarray:
+    a = arr.copy()
+    if dark is not None:
+        d = pil_to_float(dark)
+        if d is not None:
+            if d.shape != a.shape:
+                d = np.resize(d, a.shape)
+            a = np.clip(a - d, 0, None)
+    if flat is not None:
+        f = pil_to_float(flat)
+        if f is not None:
+            if f.shape != a.shape:
+                f = np.resize(f, a.shape)
+            f = np.where(f <= 0, 1.0, f)
+            a = a / f
+    return a
 
-    # Helper to derive descriptions from labels
-    def get_description_from_label(lbl: str) -> str:
-        desc = describe_label(lbl)
-        return desc
+def crop_to_roi(arr: np.ndarray, border_px=0, roi_spec=""):
+    h, w = arr.shape
+    x0, y0, ww, hh = 0, 0, w, h
+    if roi_spec.strip():
+        try:
+            x0, y0, ww, hh = [int(v) for v in roi_spec.split(",")]
+            x0 = np.clip(x0, 0, w-1); y0 = np.clip(y0, 0, h-1)
+            ww = np.clip(ww, 1, w-x0); hh = np.clip(hh, 1, h-y0)
+        except Exception:
+            pass
+    arr2 = arr[y0:y0+hh, x0:x0+ww]
+    if border_px > 0 and arr2.shape[0] > 2*border_px and arr2.shape[1] > 2*border_px:
+        arr2 = arr2[border_px:-border_px, border_px:-border_px]
+    return arr2
 
-    # Build dataframes
-    def build_df(tests, standard):
-        rows = []
-        for t in tests:
-            # UI-friendly label (clean up any HTML entities if present)
-            label = t.replace("&amp;", "&")
-            rows.append({
-                "Standard": standard,
-                "Test / Check": label,
-                "Description": get_description_from_label(label),
-                "Planned samples (min)": sample_inputs.get(t, "").strip()
-            })
-        return pd.DataFrame(rows)
+# -----------------------
+# Compute robust metric per image
+# -----------------------
+rows = []
+for _, r in meta.iterrows():
+    name = str(r["filename"])
+    if name not in img_by_name:
+        st.error(f"Image '{name}' not uploaded.")
+        st.stop()
+    im = Image.open(img_by_name[name])
+    arr = pil_to_float(im)
+    arr = apply_corrections(arr, dark_frame, flat_field)
+    arr = crop_to_roi(arr, border_px=border_crop_px, roi_spec=roi_box)
+    arr = np.clip(arr, eps, None)
 
-    df_61215 = build_df(plan_61215, "IEC 61215")
-    df_61730 = build_df(plan_61730, "IEC 61730")
+    # robust trimmed log-mean
+    logA = np.log(arr)
+    flat = np.sort(logA.flatten())
+    n = len(flat)
+    lo = int(n * (trim_low/100.0))
+    hi = int(n * (1.0 - trim_high/100.0))
+    lo = np.clip(lo, 0, n-1); hi = np.clip(hi, lo+1, n)
+    trimmed = flat[lo:hi]
+    log_mean = float(np.mean(trimmed))
+    rows.append({
+        "filename": name,
+        "log_mean": log_mean,
+        "V": float(r["V_applied_V"]),
+        "I": float(r["I_meas_A"]),
+        "exposure_s": float(r["exposure_s"]),
+        "gain_iso": float(r["gain_iso"]),
+        "temp_C": float(r["temp_C"]),
+    })
 
-    tabs = st.tabs(["IEC 61215 (Design Qualification)", "IEC 61730 (Safety)"])
-    with tabs[0]:
-        st.dataframe(df_61215, use_container_width=True)
-    with tabs[1]:
-        st.dataframe(df_61730, use_container_width=True)
+df = pd.DataFrame(rows).sort_values("V").reset_index(drop=True)
 
-    st.markdown("#### Edit the plan (optional)")
-    st.caption("Use the editor below to fine-tune tests and sample counts before exporting.")
-    df_edit = pd.concat([df_61215, df_61730], ignore_index=True)
-    edited = st.data_editor(df_edit, use_container_width=True, num_rows="dynamic")
+# -----------------------
+# EL slope fit → ideality n (using per-cell slope)
+# -----------------------
+T_K = (df["temp_C"].mean() if df["temp_C"].notna().all() else ref_T) + 273.15
 
-    # Export
-    def to_excel(df: pd.DataFrame):
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Retest plan")
-        buf.seek(0)
-        return buf
+A = np.vstack([np.ones(len(df)), df["V"].values]).T
+y = df["log_mean"].values
+coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+b = coef[1]  # slope vs module voltage
+# n ≈ q * Ns / (b * kT)
+n_EL = float(q * Ns / (b * kB * T_K)) if b > 0 else 2.0
 
-    st.markdown("#### Export")
-    csv = edited.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", data=csv, file_name="iec62915_retest_plan.csv", mime="text/csv")
-    xls = to_excel(edited)
-    st.download_button("Download Excel (.xlsx)", data=xls, file_name="iec62915_retest_plan.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+col1, col2 = st.columns(2)
+with col1:
+    st.write("**EL fit (log-intensity vs Vmodule):**")
+    fig, ax = plt.subplots(figsize=(5,4))
+    ax.scatter(df["V"], df["log_mean"], color="tab:blue", label="data")
+    ax.plot(df["V"], coef[0]+coef[1]*df["V"], color="tab:orange", label=f"fit: n ≈ {n_EL:.2f}")
+    ax.set_xlabel("Applied V (module, V)"); ax.set_ylabel("log mean intensity")
+    ax.legend(); ax.grid(True, alpha=0.3)
+    st.pyplot(fig)
+with col2:
+    st.metric("Estimated ideality n (EL-derived)", f"{n_EL:.2f}")
 
-st.markdown("---")
-st.markdown("""
-**Disclaimer & next steps**
+# -----------------------
+# Single-diode (dark) model fit
+# I = I0*(exp(q*(Vd_cell)/(n*kT)) - 1) + Vd/Rsh, with Vd = Vmodule - I*Rs, Vd_cell = Vd/Ns
+# -----------------------
+V_meas = df["V"].values
+I_meas = df["I"].values
 
-- Treat these as **indicative** sequences; align with the **official IEC TS 62915:2023 matrix** (XLS attachment) and
-  execute per the exact **IEC 61215:2021 / IEC 61730:2023** requirements, including **test sharing** rules and **sample allocations**.
-- For **electrical terminations** retests, ensure compliance with **IEC 61730-2 Clause 6** and **IEC 61215-1 Clause 4** (per **COR1:2024**).
-- Maintain a **QMS** in accordance with **IEC 62941**; for sub-components, consider **IEC 62788-1/-2**.
-""")
+def solve_current(V_module, I0, n, Rs, Rsh, T=T_K, Ns=Ns, iters=60):
+    """Fixed-point solve for I at module voltage, using per-cell junction voltage."""
+    V_module = np.asarray(V_module, dtype=float)
+    I = np.zeros_like(V_module)
+    for _ in range(int(iters)):
+        Vd = V_module - I*Rs
+        Vd_cell = Vd / max(int(Ns), 1)
+        expo_arg = np.clip(q * Vd_cell / (n * kB * T), -100.0, 100.0)
+        Id = I0 * (np.exp(expo_arg) - 1.0)
+        Ish = Vd / Rsh if Rsh > 0 else 0.0
+        I_new = Id + Ish
+        if not np.all(np.isfinite(I_new)):
+            I_new = np.nan_to_num(I_new, nan=0.0, posinf=1e30, neginf=-1e30)
+        if np.max(np.abs(I_new - I)) < 1e-9:
+            I = I_new
+            break
+        I = 0.5*I + 0.5*I_new
+    return I
+
+def loss(params):
+    I0, n, Rs, Rsh = params
+    if I0 <= 0 or n <= 0 or Rs < 0 or Rsh <= 0:
+        return 1e99
+    I_pred = solve_current(V_meas, I0, n, Rs, Rsh, T=T_K, Ns=Ns, iters=max_iter)
+    if not np.all(np.isfinite(I_pred)):
+        return 1e99
+    reg = n_reg * (n - n_EL)**2
+    return float(np.mean((I_pred - I_meas)**2) + reg)
+
+# Coarse search with safe initialization
+rng = np.random.default_rng(42)
+best = [1e-9, max(1.0, min(2.0, n_EL)), 0.1, 1e4]   # [I0, n, Rs, Rsh]
+best_loss = loss(best)
+
+I0_grid  = np.logspace(-12, -7, 6)             # A
+n_grid   = np.linspace(max(1.0, n_EL-0.4), min(2.5, n_EL+0.4), 6)
+Rs_grid  = np.linspace(0.0, 1.0, 6)             # Ω
+Rsh_grid = np.logspace(2, 5, 6)                 # Ω
+
+for I0 in I0_grid:
+    for n_try in n_grid:
+        for Rs in Rs_grid:
+            for Rsh in Rsh_grid:
+                L = loss((I0, n_try, Rs, Rsh))
+                if np.isfinite(L) and L < best_loss:
+                    best_loss = L
+                    best = [I0, n_try, Rs, Rsh]
+
+# Random local refinement
+for _ in range(200):
+    trial = [
+        max(1e-14, best[0] * 10**rng.normal(0, 0.2)),
+        float(np.clip(best[1] + rng.normal(0, 0.05), 0.9, 3.0)),
+        float(np.clip(best[2] + rng.normal(0, 0.05), 0.0, 5.0)),
+        float(np.clip(best[3] * 10**rng.normal(0, 0.2), 1.0, 1e7)),
+    ]
+    L = loss(trial)
+    if np.isfinite(L) and L < best_loss:
+        best_loss = L
+        best = trial
+
+I0_fit, n_fit, Rs_fit, Rsh_fit = best
+st.write(
+    f"**Fitted dark parameters @ {T_K:.1f} K (Ns={Ns}):**  "
+    f"I0 = {I0_fit:.3e} A,  n = {n_fit:.2f},  Rs = {Rs_fit:.3f} Ω,  Rsh = {Rsh_fit:.1f} Ω"
+)
+
+# -----------------------
+# Generate dark I–V sweep & plot
+# -----------------------
+V_sweep = np.linspace(v_min, v_max, int(v_pts))
+I_sweep = solve_current(V_sweep, I0_fit, n_fit, Rs_fit, Rsh_fit, T=T_K, Ns=Ns, iters=max_iter)
+
+fig2, ax2 = plt.subplots(figsize=(6,4))
+ax2.plot(V_sweep, I_sweep, label="Dark I–V (fit)")
+ax2.scatter(V_meas, I_meas, color="tab:red", zorder=5, label="Measured points")
+ax2.set_xlabel("Voltage (V, module)"); ax2.set_ylabel("Current (A)")
+ax2.grid(True, alpha=0.3); ax2.legend()
+st.pyplot(fig2)
+
+# -----------------------
+# Export CSV
+# -----------------------
+out = pd.DataFrame({"V_V": V_sweep, "I_A": I_sweep})
+st.download_button("Download dark IV (CSV)", out.to_csv(index=False).encode("utf-8"),
+                   file_name="dark_IV_from_EL.csv", mime="text/csv")
