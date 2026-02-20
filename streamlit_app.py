@@ -1133,4 +1133,3 @@ with tabs[2]:
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             tmpl.to_excel(writer, index=False, sheet_name="BOM_Changes")
         st.download_button("Download Template (.xlsx)", data=output.getvalue(), file_name="IEC62915_BOM_Template.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-``
